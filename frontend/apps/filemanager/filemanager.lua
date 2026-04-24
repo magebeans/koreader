@@ -1118,29 +1118,43 @@ function FileManager:showDeleteFileDialog(filepath, post_delete_callback, pre_de
     end
     local is_file = isFile(file)
     local text = (is_file and _("Delete file permanently?") or _("Delete folder permanently?")) .. "\n\n" .. BD.filepath(file)
-    if is_file and BookList.hasBookBeenOpened(file) then
+    local has_book_settings = is_file and BookList.hasBookBeenOpened(file)
+    if has_book_settings then
         text = text .. "\n\n" .. _("Book settings, highlights and notes will be deleted.")
     end
-    UIManager:show(ConfirmBox:new{
+    local check_button_settings
+    local confirmbox = ConfirmBox:new{
         text = text,
         ok_text = _("Delete"),
         ok_callback = function()
             if pre_delete_callback then
                 pre_delete_callback()
             end
-            if self:deleteFile(file, is_file) and post_delete_callback then
+            local keep_sdr = check_button_settings and check_button_settings.checked
+            if self:deleteFile(file, is_file, keep_sdr) and post_delete_callback then
                 post_delete_callback()
             end
         end,
-    })
+    }
+    if has_book_settings then
+        check_button_settings = CheckButton:new{
+            text = _("keep book settings, highlights and notes"),
+            checked = false,
+            parent = confirmbox,
+        }
+        confirmbox:addWidget(check_button_settings)
+    end
+    UIManager:show(confirmbox)
 end
 
-function FileManager:deleteFile(file, is_file)
+function FileManager:deleteFile(file, is_file, keep_sdr)
     if is_file then
         local ok = os.remove(file)
         if ok then
             BookList.resetBookInfoCache(file)
-            DocSettings.updateLocation(file) -- delete sdr
+            if not keep_sdr then
+                DocSettings.updateLocation(file) -- delete sdr
+            end
             ReadHistory:fileDeleted(file)
             ReadCollection:removeItem(file)
             return true
