@@ -37,7 +37,6 @@ local OverlapGroup = require("ui/widget/overlapgroup")
 local Screen = Device.screen
 local Size = require("ui/size")
 local SortWidget = require("ui/widget/sortwidget")
-local SyncService = require("frontend/apps/cloudstorage/syncservice")
 local TextWidget = require("ui/widget/textwidget")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TitleBar = require("ui/widget/titlebar")
@@ -209,72 +208,53 @@ function MenuDialog:setupPluginMenu()
         end,
     }
 
+    local cs = self.vocabbuilder and self.vocabbuilder.ui.cloudstorage -- Cloud storage plugin required
     local show_sync_settings = function()
-        if not settings.server then
-            local sync_settings = SyncService:new{}
-            sync_settings.onClose = function(this)
-                UIManager:close(this)
-            end
-            sync_settings.onConfirm = function(server)
-                settings.server = server
-                saveSettings()
-                DB:batchUpdateItems(self.vocabbuilder.item_table)
-                SyncService.sync(server, DB.path, DB.onSync, false)
-                self.vocabbuilder:reloadItems()
-            end
-            UIManager:close(self.sync_dialogue)
-            UIManager:close(self)
-            UIManager:show(sync_settings)
-            return
-        end
         local server = settings.server
         local buttons = {
             {
                 {
                     text = _("Delete"),
+                    enabled = server and true or false,
                     callback = function()
                         settings.server = nil
-                        SyncService.removeLastSyncDB(DB.path)
+                        os.remove(DB.path .. ".sync")
                         UIManager:close(self.sync_dialogue)
-                    end
+                    end,
                 },
                 {
                     text = _("Edit"),
                     callback = function()
                         UIManager:close(self.sync_dialogue)
                         UIManager:close(self)
-                        local sync_settings = SyncService:new{}
-                        sync_settings.onClose = function(this)
-                            UIManager:close(this)
-                        end
-
-                        sync_settings.onConfirm = function(chosen_server)
-                            if settings.server.type ~= chosen_server.type
-                                or settings.server.url ~= chosen_server.url
-                                or settings.server.address ~= chosen_server.address then
-                                    SyncService.removeLastSyncDB(DB.path)
+                        cs:onShowCloudStorageList(function(sv)
+                            settings.server = sv
+                            if server and (server.type ~= sv.type or server.url ~= sv.url or server.address ~= sv.address) then
+                                os.remove(DB.path .. ".sync")
                             end
-                            settings.server = chosen_server
-                        end
-                        UIManager:show(sync_settings)
-                    end
+                        end)
+                    end,
                 },
                 {
-                    text = _("Synchronize now"),
+                    text = _("Sync now"),
+                    enabled = server and true or false,
                     callback = function()
                         UIManager:close(self.sync_dialogue)
                         UIManager:close(self)
                         DB:batchUpdateItems(self.vocabbuilder.item_table)
-                        SyncService.sync(server, DB.path, DB.onSync, false)
+                        cs:sync(server, DB.path, DB.onSync, false)
                         self.vocabbuilder:reloadItems()
-                    end
-                }
-            }
+                    end,
+                },
+            },
         }
-        local type = server.type == "dropbox" and " (DropBox)" or " (WebDAV)"
+        local text = cs:getServerNameType(server) or _("not set")
+        if server then
+            text = text .. "\n\n" .. T(_("Folder path:\n%1"), cs.getReadablePath(server))
+                        .. "\n\n" .. _("Set up the same cloud folder on each device to sync across your devices.")
+        end
         self.sync_dialogue = ButtonDialog:new{
-            title = T(_("Cloud storage:\n%1\n\nFolder path:\n%2\n\nSet up the same cloud folder on each device to sync across your devices."),
-                         server.name.." "..type, SyncService.getReadablePath(server)),
+            title = T(_("Cloud storage: %1"), text),
             info_face = Font:getFace("smallinfofont"),
             buttons = buttons,
         }
@@ -282,6 +262,7 @@ function MenuDialog:setupPluginMenu()
     end
     local sync_button = {
         text = _("Cloud sync"),
+        enabled = cs and true or false,
         callback = function()
             show_sync_settings()
         end
@@ -503,6 +484,7 @@ end
 Individual word info dialogue widget
 --]]--
 local WordInfoDialog = FocusManager:extend{
+    word = nil,
     title = nil,
     highlighted_word = nil,
     book_title = nil,
@@ -571,6 +553,15 @@ function WordInfoDialog:init()
             UIManager:close(self)
         end
     }
+
+    local forgot_button = {
+        text = _("Forgot"),
+        callback = function()
+            self.forgot_callback()
+            UIManager:close(self)
+        end
+    }
+
     local update_button = {
         text = _("Overwrite"),
         callback = function()
@@ -579,7 +570,7 @@ function WordInfoDialog:init()
         end
     }
 
-    local buttons = self.update_callback and {{cancel_button, update_button}} or {{reset_button, remove_button}}
+    local buttons = self.update_callback and {{cancel_button, forgot_button, update_button}} or {{reset_button, remove_button}}
     if self.vocabbuilder and self.vocabbuilder.item.last_due_time then
         table.insert(buttons, {{
             text = _("Undo study status"),
@@ -599,7 +590,7 @@ function WordInfoDialog:init()
     local copy_button = Button:new{
         text = "", -- copy in nerdfont,
         callback = function()
-            Device.input.setClipboardText(self.title)
+            Device.input.setClipboardText(self.word)
             UIManager:show(Notification:new{
                 text = _("Word copied to clipboard."),
             })
@@ -626,9 +617,7 @@ function WordInfoDialog:init()
         show_parent = self
     }
 
-    if not self.update_callback then
-        table.insert(self.layout, {copy_button})
-    end
+    table.insert(self.layout, {copy_button})
     table.insert(self.layout, {self.book_title_button})
     self:mergeLayoutInVertical(focus_button)
 
@@ -656,7 +645,7 @@ function WordInfoDialog:init()
                                     alignment = self.title_align or "left",
                                 },
                                 HorizontalSpan:new{ width=Size.padding.default },
-                                not self.update_callback and copy_button or nil,
+                                copy_button,
                             },
                             self.book_title_button,
                             VerticalSpan:new{width= Size.padding.default},
@@ -1503,26 +1492,10 @@ function VocabularyBuilderWidget:refreshFooter()
         margin = 0,
         show_parent = self,
         callback = function()
-            if not settings.server then
-                local sync_settings = SyncService:new{}
-                sync_settings.onClose = function(this)
-                    UIManager:close(this)
-                end
-                sync_settings.onConfirm = function(server)
-                    settings.server = server
-                    saveSettings()
-                    DB:batchUpdateItems(self.item_table)
-                    SyncService.sync(server, DB.path, DB.onSync, false)
-                    self:reloadItems()
-                end
-                UIManager:show(sync_settings)
-            else
-                -- manual sync
+            if settings.server and self.ui.cloudstorage then
                 DB:batchUpdateItems(self.item_table)
-                UIManager:nextTick(function()
-                    SyncService.sync(settings.server, DB.path, DB.onSync, false)
-                    self:reloadItems()
-                end)
+                self.ui.cloudstorage:sync(settings.server, DB.path, DB.onSync, false)
+                self:reloadItems()
             end
         end
     }
@@ -2054,19 +2027,35 @@ function VocabBuilder:onDictButtonsReady(dict_popup, buttons)
     if dict_popup.is_wiki_fullpage then
         return
     end
+    local is_adding = true
     table.insert(buttons, 1, {{
         id = "vocabulary",
         text = _("Add to vocabulary builder"),
         font_bold = false,
         callback = function()
-            local book_title = (dict_popup.ui.doc_props and dict_popup.ui.doc_props.display_title) or _("Dictionary lookup")
-            dict_popup.ui:handleEvent(Event:new("WordLookedUp", dict_popup.lookupword, book_title, true)) -- is_manual: true
             local button = dict_popup.button_table.button_by_id["vocabulary"]
-            if button then
-                button:disable()
+            if not button then return end
+            if is_adding then
+                is_adding = false
+                local book_title = (dict_popup.ui.doc_props and dict_popup.ui.doc_props.display_title) or _("Dictionary lookup")
+                dict_popup.ui:handleEvent(Event:new("WordLookedUp", dict_popup.lookupword, book_title, true)) -- is_manual: true
+                button:setText(_("Remove from vocabulary builder"), button.width)
                 UIManager:setDirty(dict_popup, function()
                     return "ui", button.dimen
                 end)
+            else
+                UIManager:show(ConfirmBox:new{
+                    text = T(_("Remove word \"%1\" from vocabulary builder?"), dict_popup.lookupword),
+                    ok_text = _("Remove"),
+                    ok_callback = function()
+                        is_adding = true
+                        DB:remove({word = dict_popup.lookupword})
+                        button:setText(_("Add to vocabulary builder"), button.width)
+                        UIManager:setDirty(dict_popup, function()
+                            return "ui", button.dimen
+                        end)
+                    end
+                })
             end
         end
     }})
@@ -2115,12 +2104,17 @@ function VocabBuilder:onWordLookedUp(word, title, is_manual)
         local time_str = T(_("Review scheduled at %1"), os.date("%Y-%m-%d %H:%M", item.due_time))
         local dialog = WordInfoDialog:new{
             title = _("Vocabulary exists:") .. " " .. word,
+            word = word,
             highlighted_word = item.highlight or word,
             book_title = item.book_title,
             dates = date_str .. " | " .. time_str,
             prev_context = item.prev_context,
             next_context = item.next_context,
             update_callback = update,
+            forgot_callback = function()
+                DB:gotOrForgot(item, false)
+                DB:batchUpdateItems({ item })
+            end,
         }
         UIManager:show(dialog)
     else

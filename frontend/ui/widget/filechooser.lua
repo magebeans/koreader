@@ -31,8 +31,6 @@ local FileChooser = BookList:extend{
         -- Kobo
         "^%.adobe%-digital%-editions$",
         "^certificates$",
-        "^custom%-dict$",
-        "^dict$",
         "^iink$",
         "^kepub$",
         "^markups$",
@@ -185,7 +183,7 @@ function FileChooser:getListItem(dirpath, f, fullpath, attributes, collate)
             item.text = item.text.."/"
             item.bidi_wrap_func = BD.directory
             if collate.can_collate_mixed and collate.item_func ~= nil then -- used by user plugin/patch, don't remove
-                collate.item_func(item)
+                collate.item_func(item, self.ui)
             end
             if dirpath then -- file browser or PathChooser
                 item.mandatory = self:getMenuItemMandatory(item)

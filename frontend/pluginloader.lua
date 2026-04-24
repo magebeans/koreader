@@ -1,7 +1,23 @@
+--[[--
+Allows extending KOReader through plugins.
+
+Plugins will be sourced from DEFAULT_PLUGIN_PATH. If set, extra_plugin_paths
+is also used. Directories are considered plugins if the name matches
+".+%.koplugin".
+
+Running with debug turned on will log stacktraces for event handlers.
+Plugins are controlled by the following settings.
+
+- plugins_disabled
+- extra_plugin_paths
+]]
+local UIManager = require("ui/uimanager")
+local dbg = require("dbg")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
-local util = require("util")
+local ffiUtil = require("ffi/util")
 local _ = require("gettext")
+local T = ffiUtil.template
 
 local DEFAULT_PLUGIN_PATH = "plugins"
 
@@ -46,6 +62,7 @@ end
 local function getMenuTable(plugin)
     local t = {}
     t.name = plugin.name
+    t.path = plugin.path
     t.fullname = string.format("%s%s", plugin.fullname or plugin.name,
         plugin.deprecated and " (" .. _("outdated") .. ")" or "")
 
@@ -55,22 +72,54 @@ local function getMenuTable(plugin)
     return t
 end
 
-local function sandboxPluginEventHandlers(plugin)
-    for key, value in pairs(plugin) do
-        if key:sub(1, 2) == "on" and type(value) == "function" then
-            plugin[key] = function(self, ...)
-                local ok, re = pcall(value, self, ...)
-                if ok then
-                    return re
-                else
-                    logger.err("failed to call event handler", key, re)
-                    return false
-                end
-            end
+-- Event handlers defined by plugins are wrapped in a HandlerSandbox.
+-- The purpose of the sandbox is to get meaningful stack-traces out of errors happening in plugins.
+local HandlerSandbox = { mt = {} }
+
+function HandlerSandbox.new(context, fname, f, module)
+    local t = {
+        context = context,
+        fname = fname,
+        f = f,
+        log_stacktrace = dbg.is_on,
+    }
+    return setmetatable(t, HandlerSandbox.mt)
+end
+
+function HandlerSandbox:call(module, ...)
+    -- NOTE the signature is (self, module, ...)
+    -- self refers to the HandlerSandbox instance but module refers to the
+    -- self parameter of the handlers
+    local ok, re
+    if self.log_stacktrace then
+        local traceback = function(err)
+             -- do not print 2 topmost entries in traceback. The first is this local function
+             -- and the second is the `call` method of HandlerSandbox.
+             logger.err("An error occurred while executing a handler:\n"..err.."\n"..debug.traceback(self.context.name..":"..self.fname, 2))
         end
+        ok, re = xpcall(self.f, traceback, module, ...)
+    else
+        ok, re = pcall(self.f, module, ...)
+        if not ok then logger.err("An error occurred while executing handler "..self.context.name..":"..self.fname..":\n", re) end
+    end
+    -- NOTE backward compatibility with previous implementation
+    -- of handler wrapping that returned false on error
+    if ok then
+        return re
+    else
+        return false
     end
 end
 
+HandlerSandbox.mt.__call = HandlerSandbox.call
+
+local function sandboxPluginEventHandlers(plugin)
+    for key, value in pairs(plugin) do
+        if key:sub(1, 2) == "on" and type(value) == "function" then
+            plugin[key] = HandlerSandbox.new(plugin, key, value)
+        end
+    end
+end
 
 local PluginLoader = {
     show_info = true,
@@ -116,23 +165,23 @@ function PluginLoader:_discover()
         for entry in lfs.dir(lookup_path) do
             local plugin_root = lookup_path.."/"..entry
             local mode = lfs.attributes(plugin_root, "mode")
-            -- valid koreader plugin directory
-            if mode == "directory" and entry:find(".+%.koplugin$") then
+            -- A valid KOReader plugin directory ends with .koplugin
+            if mode == "directory" and entry:sub(-9) == ".koplugin" then
                 local mainfile = plugin_root.."/main.lua"
                 local metafile = plugin_root.."/_meta.lua"
+                local plugin_name = entry:sub(1, -10)
                 local disabled = false
-                if plugins_disabled and plugins_disabled[entry:sub(1, -10)] then
+                if plugins_disabled and plugins_disabled[plugin_name] then
                     mainfile = metafile
                     disabled = true
                 end
-                local __, name = util.splitFilePathName(plugin_root)
 
                 table.insert(discovered, {
                     ["main"] = mainfile,
                     ["meta"] = metafile,
                     ["path"] = plugin_root,
                     ["disabled"] = disabled,
-                    ["name"] = name,
+                    ["name"] = plugin_name,
                 })
             end
         end
@@ -158,14 +207,18 @@ function PluginLoader:_load(t)
             logger.warn("Error when loading", mainfile, plugin_module)
         elseif type(plugin_module.disabled) ~= "boolean" or not plugin_module.disabled then
             plugin_module.path = plugin_root
-            plugin_module.name = plugin_module.name or plugin_root:match("/(.-)%.koplugin")
+            plugin_module.name = v.name
             if disabled then
                 table.insert(self.disabled_plugins, plugin_module)
             else
                 local ok_meta, plugin_metamodule = pcall(dofile, metafile)
                 if ok_meta and plugin_metamodule then
                     for k, module in pairs(plugin_metamodule) do
-                        plugin_module[k] = module
+                        if k ~= "name" then
+                            plugin_module[k] = module
+                        else
+                            logger.warn("PluginLoader:", plugin_module.name, "name in _meta.lua, is deprecated and will be ignored.")
+                        end
                     end
                 end
                 sandboxPluginEventHandlers(plugin_module)
@@ -229,14 +282,13 @@ function PluginLoader:genPluginManagerSubItem()
                 return plugin.enable
             end,
             callback = function()
-                local UIManager = require("ui/uimanager")
-                local _ = require("gettext")
                 local plugins_disabled = G_reader_settings:readSetting("plugins_disabled") or {}
                 plugin.enable = not plugin.enable
                 if plugin.enable then
                     plugins_disabled[plugin.name] = nil
                 else
                     plugins_disabled[plugin.name] = true
+                    self:stopPluginInstanceByName(plugin.name)
                 end
                 G_reader_settings:saveSetting("plugins_disabled", plugins_disabled)
                 if self.show_info then
@@ -244,7 +296,49 @@ function PluginLoader:genPluginManagerSubItem()
                     UIManager:askForRestart()
                 end
             end,
-            help_text = plugin.description,
+            hold_callback = function()
+                local CheckButton = require("ui/widget/checkbutton")
+                local ConfirmBox = require("ui/widget/confirmbox")
+                local instance = self:getPluginInstance(plugin.name)
+                local deletePluginSettingsFn = instance and instance.deletePluginSettings
+                local delete_plugin_settings = false
+                local delete_plugin_settings_checkbox
+                local confirmbox = ConfirmBox:new{
+                    text = plugin.description .. "\n\n" .. T(_("Are you sure you want to delete the plugin '%1'?"), plugin.fullname),
+                    ok_text = _("Delete"),
+                    ok_callback = function()
+                        self:stopPluginInstanceByName(plugin.name)
+                        local success, err = ffiUtil.purgeDir(plugin.path)
+                        if success then
+                            if delete_plugin_settings then
+                                self:deletePluginSettingsByName(plugin.name)
+                            end
+                            local plugins_disabled = G_reader_settings:readSetting("plugins_disabled") or {}
+                            if plugins_disabled[plugin.name] then
+                                plugins_disabled[plugin.name] = nil
+                                G_reader_settings:saveSetting("plugins_disabled", plugins_disabled)
+                            end
+                            self.all_plugins = nil
+                            UIManager:askForRestart()
+                        else
+                            local InfoMessage = require("ui/widget/infomessage")
+                            UIManager:show(InfoMessage:new{
+                                text = _("Failed to delete plugin:") .. "\n" .. err,
+                            })
+                        end
+                    end,
+                }
+                delete_plugin_settings_checkbox = CheckButton:new{
+                    parent = confirmbox,
+                    text = _("Also delete plugin settings"),
+                    enabled = type(deletePluginSettingsFn) == "function",
+                    callback = function()
+                        delete_plugin_settings = not delete_plugin_settings
+                    end,
+                }
+                confirmbox:addWidget(delete_plugin_settings_checkbox)
+                UIManager:show(confirmbox)
+            end,
         })
     end
     return plugin_table
@@ -259,6 +353,74 @@ function PluginLoader:createPluginInstance(plugin, attr)
         logger.err("Failed to initialize", plugin.name, "plugin:", re)
         return nil, re
     end
+end
+
+--- Calls the stopPlugin() method on a plugin instance of a given name if it's currently loaded.
+--- This is only intended for plugins that manage external resources or processes.
+--- @param name string The name of the plugin to stop.
+--- @return boolean Success, string|nil
+function PluginLoader:stopPluginInstanceByName(name)
+    local instance = self:getPluginInstance(name)
+    local stopPluginFn = instance and instance.stopPlugin
+    if type(stopPluginFn) ~= "function" then
+        return true, nil
+    end
+    local ok, err = self:stopPluginInstance(instance)
+    if ok then
+        return true, nil
+    end
+    logger.err("PluginLoader: Failed to stop plugin instance", name, err)
+    ok, err = self:stopPluginInstance(instance, true)
+    if not ok then
+        logger.err("PluginLoader: Failed to force-stop plugin instance", name, err)
+    end
+    return false, err
+end
+
+--- Calls the deletePluginSettings() method on a plugin instance of a given name if it's currently loaded.
+--- This is only intended for plugins that manage settings in G_reader_settings or koreader/settings.
+--- @param name string The name of the plugin whose settings should be deleted.
+--- @return boolean Success, string|nil
+function PluginLoader:deletePluginSettingsByName(name)
+    local instance = self:getPluginInstance(name)
+    local deletePluginSettingsFn = instance and instance.deletePluginSettings
+    if type(deletePluginSettingsFn) ~= "function" then
+        return true, nil
+    end
+    local ok, err = self:deletePluginSettings(instance)
+    if not ok then
+        logger.err("PluginLoader: Failed to delete plugin settings", name, err)
+    end
+    return ok, err
+end
+
+--- Calls the deletePluginSettings() method on a plugin instance if it's currently loaded.
+--- This is only intended for plugins that manage settings in G_reader_settings or koreader/settings.
+--- @param instance table The plugin instance whose settings should be deleted.
+--- @return boolean Success, string|nil
+function PluginLoader:deletePluginSettings(instance)
+    local ok, err = false, "no deletePluginSettings method"
+    local fn = instance.deletePluginSettings
+    if type(fn) == "function" then
+        ok, err = pcall(fn, instance)
+    end
+    if ok then return true, nil end
+    return false, err
+end
+
+--- Calls the stopPlugin() method on a plugin instance if it's currently loaded.
+--- This is only intended for plugins that manage external resources or processes.
+--- @param instance table The plugin instance to stop.
+--- @param force boolean|nil If true, forces the plugin to stop even if it encounters errors.
+--- @return boolean Success, string|nil
+function PluginLoader:stopPluginInstance(instance, force)
+    local ok, err = false, "no stopPlugin method"
+    local fn = instance.stopPlugin
+    if type(fn) == "function" then
+        ok, err = pcall(fn, instance, force)
+    end
+    if ok then return true, nil end
+    return false, err
 end
 
 --- Checks if a specific plugin is instantiated

@@ -235,13 +235,13 @@ function CalibreWireless:connect()
 
     -- Setup inbox directory.
     local inbox_dir = G_reader_settings:readSetting("inbox_dir")
-    if not inbox_dir then
+    if not inbox_dir or lfs.attributes(inbox_dir, "mode") ~= "directory" then
         self:setInboxDir(re)
         inbox_dir = coroutine.yield()
     end
 
     -- Ensure network is online.
-    if NetworkMgr:willRerunWhenConnected(self.re) then
+    if NetworkMgr:willRerunWhenConnected(re) then
         coroutine.yield()
         if not NetworkMgr:isConnected() then
             return
@@ -337,7 +337,7 @@ function CalibreWireless:connect()
 
     -- Heartbeat monitoring…
     while ok and not self.disconnected_by_server do
-        ok = resume_in(15)
+        ok = resume_in(5 * 60)
     end
 
     local msg
@@ -430,6 +430,8 @@ function CalibreWireless:onReceiveJSON(data)
                 self:getBookCount(arg)
             elseif opcode == OPCODES.SEND_BOOK then
                 self:sendBook(arg)
+            elseif opcode == OPCODES.SEND_BOOK_METADATA then
+                self:sendBookMetadata(arg)
             elseif opcode == OPCODES.DELETE_BOOK then
                 self:deleteBook(arg)
             elseif opcode == OPCODES.GET_BOOK_FILE_SEGMENT then
@@ -704,6 +706,16 @@ function CalibreWireless:sendBook(arg)
                 end)
             end,
         })
+    end
+end
+
+function CalibreWireless:sendBookMetadata(arg)
+    logger.dbg("SEND_BOOK_METADATA", arg)
+
+    CalibreMetadata:updateBook(arg.data)
+
+    if (arg.index + 1) == arg.count then
+        CalibreMetadata:saveBookList()
     end
 end
 

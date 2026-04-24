@@ -13,6 +13,7 @@ local UIManager = require("ui/uimanager")
 local Version = require("version")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local util = require("util")
 local _ = require("gettext")
 local C_ = _.pgettext
 local T = require("ffi/util").template
@@ -303,6 +304,15 @@ function OTAManager:_buildLocalPackage()
         return nil
     end
 
+    local tar_cmd = {
+        './tar',
+        '--create', '--file='..self.installed_package,
+        '--mtime', tostring(Version:getBuildDate()),
+        '--numeric-owner', '--owner=0', '--group=0',
+        '--ignore-failed-read', '--no-recursion', '-C', '..',
+        '--verbatim-files-from', '--files-from', self.package_indexfile,
+    }
+
     -- With visual feedback if supported...
     if self.can_pretty_print then
         os.execute("./fbink -q -y -7 -pmh 'Preparing local OTA package'")
@@ -328,23 +338,19 @@ function OTAManager:_buildLocalPackage()
         end
         -- And since we want a percentage, devise the exact value we need for tar to spit out exactly 100 checkpoints ;).
         local cpoints = blocks * (1/100)
-        return os.execute(string.format(
-            "./tar --no-recursion -cf %s -C .. -T %s --checkpoint=%d --checkpoint-action=exec='./fbink -q -y -6 -P $(($TAR_CHECKPOINT/%d))'",
-            self.installed_package, self.package_indexfile, cpoints, cpoints))
-    else
-        return os.execute(string.format(
-            "./tar --no-recursion -cf %s -C .. -T %s",
-            self.installed_package, self.package_indexfile))
+        table.insert(tar_cmd, string.format('--checkpoint=%d', cpoints))
+        table.insert(tar_cmd, string.format('--checkpoint-action=exec=./fbink -q -y -6 -P $(($TAR_CHECKPOINT/%d))', cpoints))
     end
+    return os.execute(util.shell_escape(tar_cmd))
 end
 
 function OTAManager:zsync(full_dl)
     if full_dl or self:_buildLocalPackage() == 0 then
-        local zsync_wrapper = "zsync2"
+        local zsync_wrapper = "./zsync2"
         local use_pipefail = true
         -- With visual feedback if supported...
         if self.can_pretty_print then
-            zsync_wrapper = "spinning_zsync"
+            zsync_wrapper = "./spinning_zsync"
             -- And because everything is terrible, we can't check for pipefail's usability in spinning_zsync,
             -- because older ash versions abort on set -o failures...
             -- c.f., ko/#5844
@@ -352,29 +358,26 @@ function OTAManager:zsync(full_dl)
             -- (remember, os.execute is essentially system(), it goes through sh)
             use_pipefail = (os.execute("set -o pipefail 2>/dev/null") == 0)
         end
-        -- If that's a full-download fallback, drop the input tarball
-        if full_dl then
-            return os.execute(
-            ("env WITH_PIPEFAIL='%s' ./%s -o '%s' -u '%s' '%s%s'"):format(
-                use_pipefail,
-                zsync_wrapper,
-                self.updated_package,
-                self:getOTAServer(),
-                ota_dir,
-                self:getZsyncFilename())
-            )
-        else
-            return os.execute(
-            ("env WITH_PIPEFAIL='%s' ./%s -i '%s' -o '%s' -u '%s' '%s%s'"):format(
-                use_pipefail,
-                zsync_wrapper,
-                self.installed_package,
-                self.updated_package,
-                self:getOTAServer(),
-                ota_dir,
-                self:getZsyncFilename())
-            )
+        local zsync_cmd = {
+            'env',
+            string.format('WITH_PIPEFAIL=%s', use_pipefail),
+        }
+        -- Honor HTTP proxy setting.
+        local http_proxy = G_reader_settings:readSetting("http_proxy")
+        if http_proxy then
+            table.insert(zsync_cmd, string.format("http_proxy=%s", http_proxy))
         end
+        table.insert(zsync_cmd, zsync_wrapper)
+        -- Only add input tarball when not doing a full download.
+        if not full_dl then
+            util.arrayAppend(zsync_cmd, {"-i", self.installed_package})
+        end
+        util.arrayAppend(zsync_cmd, {
+            "-o", self.updated_package,
+            "-u", self:getOTAServer(),
+            ota_dir .. self:getZsyncFilename(),
+        })
+        return os.execute(util.shell_escape(zsync_cmd))
     end
 end
 

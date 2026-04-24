@@ -88,9 +88,14 @@ function Wallabag:init()
 
     -- These settings do have defaults
     self.filter_tag                    = self.wb_settings.data.wallabag.filter_tag or ""
+    self.filter_starred                = self.wb_settings.data.wallabag.filter_starred or false
     self.ignore_tags                   = self.wb_settings.data.wallabag.ignore_tags or ""
     self.auto_tags                     = self.wb_settings.data.wallabag.auto_tags or ""
-    self.archive_finished              = self.wb_settings.data.wallabag.archive_finished or true
+    if self.wb_settings.data.wallabag.archive_finished == nil then
+        self.archive_finished = true
+    else
+        self.archive_finished = self.wb_settings.data.wallabag.archive_finished
+    end
     self.archive_read                  = self.wb_settings.data.wallabag.archive_read or false
     self.archive_abandoned             = self.wb_settings.data.wallabag.archive_abandoned or false
     self.delete_instead                = self.wb_settings.data.wallabag.delete_instead or false
@@ -114,7 +119,7 @@ function Wallabag:init()
     self.archive_directory = self.wb_settings.data.wallabag.archive_directory
     if not self.archive_directory or self.archive_directory == "" then
         if self.directory and self.directory ~= "" then
-            self.archive_directory = self.directory.."archive/"
+            self.archive_directory = FFIUtil.joinPath(self.directory, "archive")
         end
     end
 
@@ -258,6 +263,17 @@ function Wallabag:addToMainMenu(menu_items)
                                             self.ignore_tags = tags
                                         end
                                     )
+                                end,
+                            },
+                            {
+                                text = _("Only download starred articles"),
+                                keep_menu_open = true,
+                                checked_func = function()
+                                    return self.filter_starred or false
+                                end,
+                                callback = function()
+                                    self.filter_starred = not self.filter_starred
+                                    self:saveSettings()
                                 end,
                             },
                             {
@@ -566,11 +582,6 @@ function Wallabag:getBearerToken()
         return false
     end
 
-    -- Add trailing slash if it is missing
-    if string.sub(self.directory, -1) ~= "/" then
-        self.directory = self.directory .. "/"
-    end
-
     -- Check if token is valid for at least 5 minutes. If so, no need to renew
     local now = os.time()
     if self.token_expiry - now > 300 then
@@ -619,6 +630,10 @@ function Wallabag:getArticleList()
 
     if self.filter_tag ~= "" then
         filtering = "&tags=" .. self.filter_tag
+    end
+
+    if self.filter_starred then
+        filtering = filtering .. "&starred=1"
     end
 
     local article_list = {}
@@ -726,7 +741,9 @@ end
 -- @treturn int 1 failed, 2 skipped, 3 downloaded
 function Wallabag:downloadArticle(article)
     local skip_article = false
+    logger.dbg("Wallabag:downloadArticle: article.title =", article.title)
     local title = util.getSafeFilename(article.title, self.directory, 230, 0)
+    logger.dbg("Wallabag:downloadArticle: local title =", title)
     local file_ext = ".epub"
     local item_url = "/api/entries/" .. article.id .. "/export.epub"
 
@@ -737,9 +754,12 @@ function Wallabag:downloadArticle(article)
     local mimetype = type(article.mimetype) == "string" and util.trim(article.mimetype:match("^[^;]*")) or nil
 
     if self.download_original_document then
+        logger.dbg("Wallabag:downloadArticle: local mimetype =", mimetype)
+        logger.dbg("Wallabag:downloadArticle: article.url =", article.url)
         if mimetype == "text/html" then
             logger.dbg("Wallabag:downloadArticle: not ignoring EPUB, because", article.url, "is HTML")
         elseif mimetype == nil then -- base ourselves on the file extension
+            logger.dbg("Wallabag:downloadArticle: mimetype = nil, using article.url instead")
             if util.getFileNameSuffix(article.url):lower():find("^html?$") then
                 logger.dbg("Wallabag:downloadArticle: not ignoring EPUB, because", article.url, "appears to be HTML")
             elseif DocumentRegistry:hasProvider(article.url) then
@@ -755,14 +775,14 @@ function Wallabag:downloadArticle(article)
             end
         elseif DocumentRegistry:hasProvider(nil, mimetype) then
             logger.dbg("Wallabag:downloadArticle: ignoring EPUB in favor of mimetype", mimetype)
-            file_ext = "." .. DocumentRegistry:mimeToExt(article.mimetype)
+            file_ext = "." .. DocumentRegistry:mimeToExt(mimetype)
             item_url = article.url
         else
             logger.dbg("Wallabag:downloadArticle: not ignoring EPUB, because there is no provider for", mimetype)
         end
     end
 
-    local local_path = self.directory .. article_id_prefix .. article.id .. article_id_postfix .. title .. file_ext
+    local local_path = FFIUtil.joinPath(self.directory, article_id_prefix..article.id..article_id_postfix..title..file_ext)
     logger.dbg("Wallabag:downloadArticle: downloading", article.id, "to", local_path)
 
     local attr = lfs.attributes(local_path)
@@ -1084,7 +1104,7 @@ function Wallabag:processRemoteDeletes(remote_ids)
     local count = 0
 
     for entry in lfs.dir(self.directory) do
-        local entry_path = self.directory .. entry
+        local entry_path = FFIUtil.joinPath(self.directory, entry)
 
         if entry ~= "." and entry ~= ".." and lfs.attributes(entry_path, "mode") == "file" then
             local local_id = self:getArticleID(entry_path)
@@ -1105,6 +1125,23 @@ function Wallabag:processRemoteDeletes(remote_ids)
 
     UIManager:close(info)
     return count
+end
+
+--- Returns true, if article should be archived/deleted on the Wallabag server.
+-- @tparam string entry_path Path to the article file
+function Wallabag:shouldUploadStatus(entry_path)
+  local doc_settings = DocSettings:open(entry_path)
+  local summary = doc_settings:readSetting("summary")
+  local status = summary and summary.status
+  local percent_finished = doc_settings:readSetting("percent_finished")
+  if status == "complete" then
+    return self.archive_finished
+  elseif status == "abandoned" then
+    return self.archive_abandoned
+  elseif percent_finished == 1 then -- 100% read
+    return self.archive_read
+  end
+  return false
 end
 
 --- Archive (or delete) locally finished articles on the Wallabag server.
@@ -1133,7 +1170,7 @@ function Wallabag:uploadStatuses(quiet)
             local skip = false
 
             if entry ~= "." and entry ~= ".." then
-                local entry_path = self.directory .. entry
+                local entry_path = FFIUtil.joinPath(self.directory, entry)
 
                 if DocSettings:hasSidecarFile(entry_path) then
                     logger.dbg("Wallabag:uploadStatuses:", entry_path, "has sidecar file")
@@ -1142,17 +1179,8 @@ function Wallabag:uploadStatuses(quiet)
                         self:addTagsFromReview(entry_path)
                     end
 
-                    local doc_settings = DocSettings:open(entry_path)
-                    local summary = doc_settings:readSetting("summary")
-                    local status = summary and summary.status
-                    local percent_finished = doc_settings:readSetting("percent_finished")
-
-                    if (
-                        (status == "complete" and self.archive_finished)
-                        or (status == "abandoned" and self.archive_abandoned)
-                        or (percent_finished == 1 and self.archive_read)
-                    ) then
-                        logger.dbg("Wallabag:uploadStatuses: - has been finished, so archiving/deleting on remote…")
+                    if self:shouldUploadStatus(entry_path) then
+                        logger.dbg("Wallabag:uploadStatuses: - archiving/deleting on remote…")
 
                         if self:archiveArticle(entry_path) then
                             count_remote = count_remote + 1
@@ -1173,7 +1201,7 @@ function Wallabag:uploadStatuses(quiet)
                                 count_local = count_local + self:deleteLocalArticle(entry_path)
                             end -- if use local archive
                         end -- if not skip
-                    else -- not finished
+                    else -- not shouldUploadStatus
                         logger.dbg("Wallabag:uploadStatuses: - but has not been finished yet")
                     end -- if finished
                 end -- if has sidecar
@@ -1329,7 +1357,7 @@ function Wallabag:archiveLocalArticle(path)
 
     if lfs.attributes(path, "mode") == "file" then
         local _, file = util.splitFilePathName(path)
-        local new_path = self.archive_directory..file
+        local new_path = FFIUtil.joinPath(self.archive_directory, file)
         if FileManager:moveFile(path, new_path) then
             result = 1
         end
@@ -1478,6 +1506,20 @@ Restart KOReader after editing the config file.]]), BD.dirpath(DataStorage:getSe
                     callback = function()
                         local myfields = self.settings_dialog:getFields()
                         self.server_url    = myfields[1]:gsub("/*$", "") -- remove all trailing slashes
+                        if not self.server_url:match("^https?://") then
+                            UIManager:show(MultiConfirmBox:new{
+                                text = _("The server URL should start with http:// or http://."),
+                                choice1_text = _("http://"),
+                                choice1_callback = function()
+                                    self.settings_dialog.input_fields[1]:setText("http://" .. self.server_url)
+                                end,
+                                choice2_text = _("https://"),
+                                choice2_callback = function()
+                                    self.settings_dialog.input_fields[1]:setText("https://" .. self.server_url)
+                                end,
+                            })
+                            return
+                        end
                         self.client_id     = myfields[2]
                         self.client_secret = myfields[3]
                         self.username      = myfields[4]
@@ -1530,7 +1572,7 @@ function Wallabag:setDownloadDirectory(touchmenu_instance)
         onConfirm = function(path)
             self.directory = path
             self:saveSettings()
-            logger.dbg("Wallabag:setDownloadDirectory: set download directory to", path)
+            logger.dbg("Wallabag:setDownloadDirectory: set download directory to", self.directory)
             if touchmenu_instance then
                 touchmenu_instance:updateItems()
             end
@@ -1544,7 +1586,7 @@ function Wallabag:setArchiveDirectory(touchmenu_instance)
         onConfirm = function(path)
             self.archive_directory = path
             self:saveSettings()
-            logger.dbg("Wallabag:setArchiveDirectory: set archive directory to", path)
+            logger.dbg("Wallabag:setArchiveDirectory: set archive directory to", self.archive_directory)
             if touchmenu_instance then
                 touchmenu_instance:updateItems()
             end
@@ -1598,6 +1640,7 @@ function Wallabag:saveSettings()
         password                      = self.password,
         directory                     = self.directory,
         filter_tag                    = self.filter_tag,
+        filter_starred                = self.filter_starred,
         ignore_tags                   = self.ignore_tags,
         auto_tags                     = self.auto_tags,
         archive_finished              = self.archive_finished,
@@ -1612,7 +1655,7 @@ function Wallabag:saveSettings()
         remove_read_from_history      = self.remove_read_from_history,
         remove_abandoned_from_history = self.remove_abandoned_from_history,
         download_original_document    = self.download_original_document,
-        offline_queue                  = self.offline_queue,
+        offline_queue                 = self.offline_queue,
         use_local_archive             = self.use_local_archive,
         archive_directory             = self.archive_directory,
         file_block_timeout            = self.file_block_timeout,

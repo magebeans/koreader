@@ -15,8 +15,8 @@ local T = ffiutil.template
 -- https://en.wikipedia.org/w/api.php?action=query&prop=extracts&format=jsonfm&explaintext=&redirects=&titles=E-reader
 --
 -- To get parsed HTML :
--- https://en.wikipedia.org/w/api.php?action=parse&page=E-book
--- https://en.wikipedia.org/w/api.php?action=parse&page=E-book&prop=text|sections|displaytitle|revid&disablelimitreport=&disableeditsection
+-- https://en.wikipedia.org/w/api.php?action=parse&page=Ebook
+-- https://en.wikipedia.org/w/api.php?action=parse&page=Ebook&prop=text|tocdata|displaytitle|revid&disablelimitreport=&disableeditsection
 -- https://www.mediawiki.org/wiki/API:Parsing_wikitext#parse
 --]]
 
@@ -44,19 +44,20 @@ local Wikipedia = {
    -- Full article, parsed to output text (+ main thumbnail image)
    wiki_full_params = {
        action = "query",
-       prop = "extracts|pageimages",
+       prop = "extracts|pageimages|langlinks",
        format = "json",
        -- exintro = nil, -- get more than only the intro
        explaintext = "",
        redirects = "",
        -- title = nil, -- text to lookup, will be added below
+       lllimit = 500, -- (default nb of langlinks returned is 10)
    },
    -- Full article, parsed to output HTML, for Save as EPUB
    wiki_phtml_params = {
        action = "parse",
        format = "json",
        -- we only need the following pieces of information
-       prop = "text|sections|displaytitle|revid",
+       prop = "text|tocdata|displaytitle|revid",
        -- page = nil, -- text to lookup, will be added below
        -- disabletoc = "", -- if we want to remove toc IN html
             -- 20230722: there is no longer the TOC in the html no matter this param
@@ -98,8 +99,36 @@ function Wikipedia:getWikiServer(lang)
     return string.format(self.wiki_server, lang or self.default_lang)
 end
 
+-- Search for the response header 'set-cookie', and extract the associated cookies
+local function extractCookies(headers)
+    if not headers then return nil end
+    local cookies = {}
+    for key, value in pairs(headers) do
+        if string.lower(key) == "set-cookie" then
+            for cookie_part in string.gmatch(value, "([^,]+)") do
+                -- Only extract the name=value part, and not browser attributes after ';'
+                local name, cookie_value = cookie_part:match("([^=]+)=([^;]+)")
+                if name and cookie_value then
+                    name = name:match("^%s*(.-)%s*$")
+                    cookie_value = cookie_value:match("^%s*(.-)%s*$")
+                    table.insert(cookies, name .. "=" .. cookie_value)
+                end
+            end
+        end
+    end
+    if #cookies > 0 then
+        -- String representation of cookie, i.e. "WMF-...; WMF-Last_Access..."
+        return table.concat(cookies, "; ")
+    end
+    return nil
+end
+
+-- Wikipedia gives user cookies their own throttling bucket (70 / 30), use it for image resizing which has strict rate throttling.
+-- See https://gerrit.wikimedia.org/r/plugins/gitiles/mediawiki/core/+blame/90f9bb549d5fc17eb7e71c094ded6264a71f609c/includes/MainConfigSchema.php#8997
+local cached_cookie = nil
+
 -- Get URL content
-local function getUrlContent(url, timeout, maxtime)
+local function getUrlContent(url, timeout, maxtime, reuse_cookie)
     local http = require("socket.http")
     local ltn12 = require("ltn12")
     local socket = require("socket")
@@ -119,10 +148,23 @@ local function getUrlContent(url, timeout, maxtime)
         method  = "GET",
         sink    = maxtime and socketutil.table_sink(sink) or ltn12.sink.table(sink),
     }
+    -- Add headers only when an image_cookie is present, otherwise make a default call without cookie headers
+    if reuse_cookie then
+        logger.dbg("Creating a request with cookie header:", cached_cookie)
+        request.headers = {
+            cookie = cached_cookie,
+            referer = "https://en.wikipedia.org/"
+        }
+    end
 
     local code, headers, status = socket.skip(1, http.request(request))
     socketutil:reset_timeout()
     local content = table.concat(sink) -- empty or content accumulated till now
+    -- Cache cookies from Wikipedia API responses
+    local response_cookie = nil
+    if not reuse_cookie and headers then
+        response_cookie = extractCookies(headers)
+    end
     -- logger.dbg("code:", code)
     -- logger.dbg("headers:", headers)
     -- logger.dbg("status:", status)
@@ -151,7 +193,7 @@ local function getUrlContent(url, timeout, maxtime)
             return false, "Incomplete content received"
         end
     end
-    return true, content
+    return true, content, response_cookie
 end
 
 function Wikipedia:setTrapWidget(trap_widget)
@@ -203,12 +245,12 @@ function Wikipedia:loadPage(text, lang, page_type, plain)
     end
 
     local built_url = url.build(parsed)
-    local completed, success, content
+    local completed, success, content, response_cookie
     if self.trap_widget then -- if previously set with Wikipedia:setTrapWidget()
         local Trapper = require("ui/trapper")
         local timeout, maxtime = 30, 60
         -- We use dismissableRunInSubprocess with complex return values:
-        completed, success, content = Trapper:dismissableRunInSubprocess(function()
+        completed, success, content, response_cookie = Trapper:dismissableRunInSubprocess(function()
             return getUrlContent(built_url, timeout, maxtime)
         end, self.trap_widget)
         if not completed then
@@ -219,10 +261,13 @@ function Wikipedia:loadPage(text, lang, page_type, plain)
         -- blocking without one (but 20s may be needed to fetch the main HTML
         -- page of big articles when making an EPUB).
         local timeout, maxtime = 20, 60
-        success, content = getUrlContent(built_url, timeout, maxtime)
+        success, content, response_cookie = getUrlContent(built_url, timeout, maxtime)
     end
     if not success then
         error(content)
+    end
+    if response_cookie then
+        cached_cookie = response_cookie
     end
 
     if content ~= "" and string.sub(content, 1, 1) == "{" then
@@ -400,7 +445,7 @@ local function image_load_bb_func(image, highres)
     -- We use dismissableRunInSubprocess with simple string return value to
     -- avoid serialization/deserialization of a long string of image bytes
     local completed, data = Trapper:dismissableRunInSubprocess(function()
-        local success, data = getUrlContent(source, timeout, maxtime)
+        local success, data = getUrlContent(source, timeout, maxtime, true) -- reuse_cookie
         -- With simple string value, we're not able to return the failure
         -- reason, so log it here
         if not success then
@@ -671,7 +716,7 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
     local wiki_base_url = self:getWikiServer(lang)
 
     -- Get infos from wikipedia result
-    -- (see example at https://en.wikipedia.org/w/api.php?action=parse&page=E-book&prop=text|sections|displaytitle|revid&disablelimitreport=&disableeditsection)
+    -- (see example at https://en.wikipedia.org/w/api.php?action=parse&page=Ebook&prop=text|tocdata|displaytitle|revid&disablelimitreport=&disableeditsection)
     local cancelled = false
     local html = phtml.text["*"] -- html content
     local page_cleaned = page:gsub("_", " ") -- page title
@@ -682,7 +727,8 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
     -- encodes. (We don't escape < or > as these JSON strings may contain HTML tags)
     page_cleaned = util.htmlEntitiesToUtf8(page_cleaned):gsub("&", "&#38;")
     page_htmltitle = util.htmlEntitiesToUtf8(page_htmltitle):gsub("&", "&#38;")
-    local sections = phtml.sections -- Wikipedia provided TOC
+    -- Wikipedia provided TOC (might be "null", that JSON.decode() converts to a function)
+    local sections = type(phtml.tocdata) == "table" and phtml.tocdata.sections or {}
     local bookid = string.format("wikipedia_%s_%s_%s", lang, phtml.pageid, phtml.revid)
     -- Not sure if this bookid may ever be used by indexing software/calibre, but if it is,
     -- should it changes if content is updated (as now, including the wikipedia revisionId),
@@ -758,6 +804,9 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
             if srcset then
                 srcset = " "..srcset.. ", " -- for next pattern to possibly match 1st or last item
                 src2x = srcset:match([[ (%S+) 2x, ]])
+                if not src2x then -- if no 2x, we may have 1.5x
+                    src2x = srcset:match([[ (%S+) 1.5x, ]])
+                end
                 if src2x then
                     if src2x:sub(1,2) == "//" then
                         src2x = "https:" .. src2x
@@ -836,28 +885,31 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
     -- Open the zip file (with .tmp for now, as crengine may still
     -- have a handle to the final epub_path, and we don't want to
     -- delete a good one if we fail/cancel later)
+    local Archiver = require("ffi/archiver")
+    local epub = Archiver.Writer:new{}
     local epub_path_tmp = epub_path .. ".tmp"
-    local ZipWriter = require("ffi/zipwriter")
-    local epub = ZipWriter:new{}
-    if not epub:open(epub_path_tmp) then
+    if not epub:open(epub_path_tmp, "epub") then
         return false
     end
 
     -- We now create and add all the required epub files
+    local mtime = os.time()
 
     -- ----------------------------------------------------------------
     -- /mimetype : always "application/epub+zip"
-    epub:add("mimetype", "application/epub+zip", true)
+    epub:setZipCompression("store")
+    epub:addFileFromMemory("mimetype", "application/epub+zip", mtime)
+    epub:setZipCompression("deflate")
 
     -- ----------------------------------------------------------------
     -- /META-INF/container.xml : always the same content
-    epub:add("META-INF/container.xml", [[
+    epub:addFileFromMemory("META-INF/container.xml", [[
 <?xml version="1.0"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
   <rootfiles>
     <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
   </rootfiles>
-</container>]])
+</container>]], mtime)
 
     -- ----------------------------------------------------------------
     -- OEBPS/content.opf : metadata + list of other files (paths relative to OEBPS/ directory)
@@ -916,14 +968,14 @@ function Wikipedia:createEpub(epub_path, page, lang, with_images)
   </spine>
 </package>
 ]])
-    epub:add("OEBPS/content.opf", table.concat(content_opf_parts))
+    epub:addFileFromMemory("OEBPS/content.opf", table.concat(content_opf_parts), mtime)
 
     -- ----------------------------------------------------------------
     -- OEBPS/stylesheet.css
     -- crengine will use its own data/epub.css, we just add/fix a few styles
     -- to look more alike wikipedia web pages (that the user can ignore
     -- with "Embedded Style" off)
-    epub:add("OEBPS/stylesheet.css", [[
+    epub:addFileFromMemory("OEBPS/stylesheet.css", [[
 /* Generic styling picked from our epub.css (see it for comments),
    to give this epub a book look even if used with html5.css */
 body {
@@ -1270,7 +1322,7 @@ abbr.abbr {
     display: none;
 }
 /* hiding .noprint may discard some interesting links */
-]])
+]], mtime)
 
     -- ----------------------------------------------------------------
     -- OEBPS/toc.ncx : table of content
@@ -1296,7 +1348,7 @@ abbr.abbr {
         -- We need to do as for page_htmltitle above. But headings can contain
         -- html entities for < and > that we need to put back as html entities
         s_title = util.htmlEntitiesToUtf8(s_title):gsub("&", "&#38;"):gsub(">", "&gt;"):gsub("<", "&lt;")
-        local s_level = s.toclevel
+        local s_level = s.tocLevel
         if s_level > depth then
             depth = s_level -- max depth required in toc.ncx
         end
@@ -1351,7 +1403,7 @@ abbr.abbr {
   </navMap>
 </ncx>
 ]])
-    epub:add("OEBPS/toc.ncx", table.concat(toc_ncx_parts))
+    epub:addFileFromMemory("OEBPS/toc.ncx", table.concat(toc_ncx_parts), mtime)
 
     -- ----------------------------------------------------------------
     -- HTML table of content
@@ -1368,7 +1420,7 @@ abbr.abbr {
         -- for the links to be valid.
         local s_anchor = s.anchor:gsub("&", "&amp;"):gsub('"', "&quot;"):gsub(">", "&gt;"):gsub("<", "&lt;")
         local s_title = string.format("%s %s", s.number, s.line)
-        local s_level = s.toclevel
+        local s_level = s.tocLevel
         if s_level == cur_level then
             table.insert(toc_html_parts, "</li>")
         elseif s_level < cur_level then
@@ -1479,7 +1531,7 @@ abbr.abbr {
     if self:isWikipediaLanguageRTL(lang) then
         html_dir = ' dir="rtl"'
     end
-    epub:add("OEBPS/content.html", string.format([[
+    epub:addFileFromMemory("OEBPS/content.html", string.format([[
 <html xmlns="http://www.w3.org/1999/xhtml"%s>
 <head>
   <title>%s</title>
@@ -1493,7 +1545,7 @@ abbr.abbr {
 %s
 </body>
 </html>
-]], html_dir, page_cleaned, page_htmltitle, lang:upper(), saved_on, see_online_version, html))
+]], html_dir, page_cleaned, page_htmltitle, lang:upper(), saved_on, see_online_version, html), mtime)
 
     -- Force a GC to free the memory we used till now (the second call may
     -- help reclaim more memory).
@@ -1526,7 +1578,7 @@ abbr.abbr {
                 src = img.src2x
             end
             logger.dbg("Getting img ", src)
-            local success, content = getUrlContent(src)
+            local success, content = getUrlContent(src, nil, nil, true) -- reuse_cookie
             -- success, content = getUrlContent(src..".unexistant") -- to simulate failure
             if success then
                 logger.dbg("success, size:", #content)
@@ -1535,11 +1587,11 @@ abbr.abbr {
             end
             if success then
                 -- Images do not need to be compressed, so spare some cpu cycles
-                local no_compression = true
-                if img.mimetype == "image/svg+xml" then -- except for SVG images (which are XML text)
-                    no_compression = false
+                if img.mimetype ~= "image/svg+xml" then -- except for SVG images (which are XML text)
+                    epub:setZipCompression("store")
                 end
-                epub:add("OEBPS/"..img.imgpath, content, no_compression)
+                epub:addFileFromMemory("OEBPS/"..img.imgpath, content, mtime)
+                epub:setZipCompression("deflate")
             else
                 go_on = UI:confirm(T(_("Downloading image %1 failed. Continue anyway?"), inum), _("Stop"), _("Continue"))
                 if not go_on then

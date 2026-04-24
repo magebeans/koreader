@@ -4,6 +4,7 @@ ReaderUI is an abstraction for a reader interface.
 It works using data gathered from a document interface.
 ]]--
 
+local Archiver = require("ffi/archiver")
 local BD = require("ui/bidi")
 local BookList = require("ui/widget/booklist")
 local Device = require("device")
@@ -177,7 +178,8 @@ function ReaderUI:init()
     self:registerModule("bookmark", ReaderBookmark:new{
         dialog = self.dialog,
         view = self.view,
-        ui = self
+        ui = self,
+        document = self.document,
     })
     self:registerModule("annotation", ReaderAnnotation:new{
         dialog = self.dialog,
@@ -489,12 +491,19 @@ function ReaderUI:init()
     -- CREngine only reports correct page count after rendering is done
     -- Need the same event for PDF document
     self:handleEvent(Event:new("ReaderReady", self.doc_settings))
+    self.doc_settings:saveSetting("doc_pages", self.document:getPageCount())
 
     for _,v in ipairs(self.postReaderReadyCallback) do
         v()
     end
     self.postReaderReadyCallback = nil
     self.reloading = nil
+    if self.after_open_callback then
+        self:after_open_callback()
+        self.after_open_callback = nil
+    end
+
+    BookList.setBookInfoCache(self.document.file, self.doc_settings)
 
     Device:setIgnoreInput(false) -- Allow processing of events (on Android).
     Input:inhibitInputUntil(0.2)
@@ -566,7 +575,12 @@ function ReaderUI:showFileManager(file, selected_files)
         last_dir, last_file = self:getLastDirFile(true)
     end
     local FileManager = require("apps/filemanager/filemanager")
-    FileManager:showFiles(last_dir, last_file, selected_files)
+    if FileManager.instance then
+        FileManager.instance.file_chooser:changeToPath(last_dir, last_file)
+        FileManager.instance.selected_files = selected_files
+    else
+        FileManager:showFiles(last_dir, last_file, selected_files)
+    end
 end
 
 function ReaderUI:onShowingReader()
@@ -587,7 +601,7 @@ end
 --- @note: Will sanely close existing FileManager/ReaderUI instance for you!
 ---        This is the *only* safe way to instantiate a new ReaderUI instance!
 ---        (i.e., don't look at the testsuite, which resorts to all kinds of nasty hacks).
-function ReaderUI:showReader(file, provider, seamless, is_provider_forced)
+function ReaderUI:showReader(file, provider, seamless, is_provider_forced, after_open_callback)
     logger.dbg("show reader ui")
 
     if lfs.attributes(file, "mode") ~= "file" then
@@ -604,6 +618,7 @@ function ReaderUI:showReader(file, provider, seamless, is_provider_forced)
         provider = self:extendProvider(file, provider, is_provider_forced)
     end
     if provider and provider.provider then
+        self.after_open_callback = after_open_callback
         -- We can now signal the existing ReaderUI/FileManager instances that it's time to go bye-bye...
         UIManager:broadcastEvent(Event:new("ShowingReader"))
         self:showReaderCoroutine(file, provider, seamless)
@@ -622,18 +637,16 @@ function ReaderUI:extendProvider(file, provider, is_provider_forced)
     -- or on the original file double extension ("fb2.zip" etc).
     local _, file_type = filemanagerutil.splitFileNameType(file) -- supports double-extension
     if file_type == "zip" then
-        -- read the content of zip-file and get extension of the 1st file
-        local std_out = io.popen("unzip -qql \"" .. file .. "\"")
-        if std_out then
-            local size, ext
-            for line in std_out:lines() do
-                size, ext = string.match(line, "%s+(%d+)%s+.+%.([^.]+)")
-                if size and ext then break end
+        local arc = Archiver.Reader:new()
+        if arc:open(file) then
+            for entry in arc:iterate() do
+                local ext = util.getFileNameSuffix(entry.path)
+                if ext and entry.mode == "file" and entry.size > 0 then
+                    file_type = ext:lower()
+                    break
+                end
             end
-            std_out:close()
-            if ext ~= nil then
-                file_type = ext:lower()
-            end
+            arc:close()
         end
         if not is_provider_forced then
             local providers = DocumentRegistry:getProviders("dummy." .. file_type)
@@ -715,7 +728,10 @@ function ReaderUI:doShowReader(file, provider, seamless)
         covers_fullscreen = true, -- hint for UIManager:_repaint()
         document = document,
         reloading = self.reloading,
+        after_open_callback = self.after_open_callback,
     }
+    self.reloading = nil
+    self.after_open_callback = nil
 
     Screen:setWindowTitle(reader.doc_props.display_title)
     Device:notifyBookState(reader.doc_props.display_title, document)
@@ -826,7 +842,8 @@ function ReaderUI:onClose(full_refresh)
     end
     UIManager:close(self.dialog, full_refresh ~= false and "full")
     if file then
-        BookList.setBookInfoCache(file, self.doc_settings)
+        BookList.setBookInfoCacheProperty(file, "percent_finished", self.doc_settings:readSetting("percent_finished"))
+        -- other cached properties of the currently opened document are updated in real time
     end
 end
 
@@ -876,14 +893,13 @@ function ReaderUI:onReload()
     self:reloadDocument()
 end
 
-function ReaderUI:reloadDocument(after_close_callback, seamless)
+function ReaderUI:reloadDocument(after_close_callback, seamless, after_open_callback)
     local file = self.document.file
     local provider = getmetatable(self.document).__index
 
     -- Mimic onShowingReader's refresh optimizations
     self.tearing_down = true
     self.dithered = nil
-    self.reloading = true
 
     self:handleEvent(Event:new("CloseReaderMenu"))
     self:handleEvent(Event:new("CloseConfigMenu"))
@@ -895,10 +911,11 @@ function ReaderUI:reloadDocument(after_close_callback, seamless)
         after_close_callback(file, provider)
     end
 
-    self:showReader(file, provider, seamless)
+    self.reloading = true
+    self:showReader(file, provider, seamless, nil, after_open_callback)
 end
 
-function ReaderUI:switchDocument(new_file, seamless)
+function ReaderUI:switchDocument(new_file, seamless, after_open_callback)
     if not new_file then return end
 
     -- Mimic onShowingReader's refresh optimizations
@@ -910,11 +927,30 @@ function ReaderUI:switchDocument(new_file, seamless)
     self.highlight:onClose() -- close highlight dialog if any
     self:onClose(false)
 
-    self:showReader(new_file, nil, seamless)
+    self:showReader(new_file, nil, seamless, nil, after_open_callback)
 end
 
 function ReaderUI:onOpenLastDoc()
     self:switchDocument(self.menu:getPreviousFile())
+end
+
+function ReaderUI:onAnnotationsModified()
+    BookList.setBookInfoCacheProperty(self.document.file, "has_annotations", self.annotation:hasAnnotations())
+end
+
+function ReaderUI:onDocumentRerendered()
+    local pages = self.document:getPageCount()
+    self.doc_settings:saveSetting("doc_pages", pages)
+    if self.doc_settings:nilOrFalse("pagemap_use_page_labels") then
+        BookList.setBookInfoCacheProperty(self.document.file, "pages", pages)
+    end
+end
+
+function ReaderUI:onUsePageLabelsUpdated()
+    local pages = self.doc_settings:isTrue("pagemap_use_page_labels")
+        and self.doc_settings:readSetting("pagemap_doc_pages")
+         or self.doc_settings:readSetting("doc_pages")
+    BookList.setBookInfoCacheProperty(self.document.file, "pages", pages)
 end
 
 function ReaderUI:getCurrentPage()

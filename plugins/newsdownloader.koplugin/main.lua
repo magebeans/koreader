@@ -1,5 +1,6 @@
 local BD = require("ui/bidi")
 local DataStorage = require("datastorage")
+local DocumentRegistry = require("document/documentregistry")
 local DownloadBackend = require("epubdownloadbackend")
 local ReadHistory = require("readhistory")
 local FFIUtil = require("ffi/util")
@@ -15,6 +16,7 @@ local Persist = require("persist")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local dateparser = require("lib.dateparser")
 local http = require("socket.http")
+local mime = require("mime")
 local lfs = require("libs/libkoreader-lfs")
 local ltn12 = require("ltn12")
 local logger = require("logger")
@@ -43,7 +45,7 @@ local FEED_TYPE_ATOM = "atom"
 -- If a title looks like <title>blabla</title> it'll just be feed.title.
 -- If a title looks like <title attr="alb">blabla</title> then we get a table
 -- where [1] is the title string and the attributes are also available.
-local function getFeedTitle(possible_title)
+function NewsDownloader.getFeedTitle(possible_title)
     if type(possible_title) == "string" then
         return util.htmlEntitiesToUtf8(possible_title)
     elseif possible_title[1] and type(possible_title[1]) == "string" then
@@ -59,7 +61,9 @@ local function getEmptyFeed()
         download_full_article = false,
         include_images = true,
         enable_filter = false,
-        filter_element = ""
+        filter_element = "",
+        block_element = "",
+        http_auth = { username = nil, password = nil },
     }
 end
 
@@ -69,7 +73,7 @@ end
 -- Some feeds that can be used for unit test.
 -- http://fransdejonge.com/feed/ for multiple links.
 -- https://github.com/koreader/koreader/commits/master.atom for single link with attributes.
-local function getFeedLink(possible_link)
+function NewsDownloader.getFeedLink(possible_link)
     local E = {}
     if type(possible_link) == "string" then
         return possible_link
@@ -78,6 +82,52 @@ local function getFeedLink(possible_link)
     elseif ((possible_link[1] or E)._attr or E).href then
         return possible_link[1]._attr.href
     end
+end
+
+-- Look for author names that look like
+-- <dc:creator>First Author, Second Author</dc:creator>
+-- or
+-- <author><name>First Author</name></author>
+-- <author><name>Second Author</name></author>...
+-- and return a byline or empty string
+local function getByline(feed)
+    if type(feed["dc:creator"]) == "string" then
+        return feed["dc:creator"]
+    end
+    if type(feed["dc:creator"]) == "table" then
+        local i = 0
+        local authors = {}
+        for _ in pairs(feed["dc:creator"]) do
+            i = i + 1
+            if feed["dc:creator"][i] == nil then
+                break
+            end
+            authors[i] = feed["dc:creator"][i]
+        end
+        if #authors > 0 then
+            return table.concat(authors, ", ")
+        end
+    end
+    if feed.author then
+        if type(feed.author.name) == "string" then -- single author
+            return feed.author.name
+        end
+        if type(feed.author) == "table" then
+            local i = 0
+            local authors = {}
+            for _ in pairs(feed.author) do -- multiple authors
+                i = i + 1
+                if feed.author[i] == nil then
+                    break
+                end
+                authors[i] = feed.author[i].name
+            end
+            if #authors > 0 then
+                return table.concat(authors, ", ")
+            end
+        end
+    end
+    return ""
 end
 
 function NewsDownloader:init()
@@ -207,6 +257,20 @@ function NewsDownloader:lazyInitialization()
     end
 end
 
+---Parses comma separated option string into table.
+---@param opt any
+---@return table
+local function parseCommaSeparatedOption(opt)
+    if type(opt) == "string" then
+        local result = {}
+        for part in string.gmatch(opt, "([^,]+)") do
+            table.insert(result, part)
+        end
+        return result
+    end
+    return {}
+end
+
 function NewsDownloader:loadConfigAndProcessFeeds(touchmenu_instance)
     local UI = require("ui/trapper")
     logger.dbg("force repaint due to upcoming blocking calls")
@@ -252,8 +316,10 @@ function NewsDownloader:loadConfigAndProcessFeeds(touchmenu_instance)
         local download_full_article = feed.download_full_article or false
         local include_images = not never_download_images and feed.include_images
         local enable_filter = feed.enable_filter or feed.enable_filter == nil
-        local filter_element = feed.filter_element or feed.filter_element == nil
+        local filter_element = parseCommaSeparatedOption(feed.filter_element)
+        local block_element = parseCommaSeparatedOption(feed.block_element)
         local credentials = feed.credentials
+        local http_auth = feed.http_auth
         -- Check if the two required attributes are set.
         if url and limit then
             feed_message = T(_("Processing %1/%2:\n%3"), idx, total_feed_entries, BD.url(url))
@@ -262,13 +328,15 @@ function NewsDownloader:loadConfigAndProcessFeeds(touchmenu_instance)
             self:processFeedSource(
                 url,
                 credentials,
+                http_auth,
                 tonumber(limit),
                 unsupported_feeds_urls,
                 download_full_article,
                 include_images,
                 feed_message,
                 enable_filter,
-                filter_element)
+                filter_element,
+                block_element)
         else
             logger.warn("NewsDownloader: invalid feed config entry.", feed)
         end
@@ -340,16 +408,21 @@ function NewsDownloader:loadConfigAndProcessFeedsWithUI(touchmenu_instance)
     end)
 end
 
-function NewsDownloader:processFeedSource(url, credentials, limit, unsupported_feeds_urls, download_full_article, include_images, message, enable_filter, filter_element)
+function NewsDownloader:processFeedSource(url, credentials, http_auth, limit, unsupported_feeds_urls, download_full_article, include_images, message, enable_filter, filter_element, block_element)
     -- Check if we have a cached response first
     local cache = DownloadBackend:getCache()
     local cached_response = cache:check(url)
-    local ok, error, response
+    local ok, error, content_type, response
 
     local cookies = nil
+    local extra_headers = nil
     if credentials ~= nil then
         logger.dbg("Auth Cookies from ", credentials.url)
         cookies = DownloadBackend:getConnectionCookies(credentials.url, credentials.auth)
+    end
+
+    if http_auth and http_auth.username and http_auth.password then
+        extra_headers = { ["Authorization"] = "Basic " .. mime.b64((http_auth.username or "") .. ":" .. (http_auth.password or "")) }
     end
 
     if cached_response then
@@ -394,6 +467,9 @@ function NewsDownloader:processFeedSource(url, credentials, limit, unsupported_f
                 if cookies then
                     headers["Cookie"] = cookies
                 end
+                if extra_headers and extra_headers["Authorization"] then
+                    headers["Authorization"] = extra_headers["Authorization"]
+                end
                 local code, response_headers = socket.skip(1, http.request{
                     url = url,
                     headers = headers,
@@ -419,15 +495,19 @@ function NewsDownloader:processFeedSource(url, credentials, limit, unsupported_f
     end
 
     if not response then
-        ok, response = pcall(function()
-            return DownloadBackend:getResponseAsString(url, cookies, true)
+        ok, content_type, response = pcall(function()
+            return DownloadBackend:getResponseAsString(url, cookies, true, extra_headers)
         end)
     end
 
-    local feeds
+    local feeds, err
     -- Check to see if a response is available to deserialize.
     if ok then
-        feeds = self:deserializeXMLString(response)
+        feeds, err = self:deserializeXMLString(response)
+        if not feeds then
+            logger.err("NewsDownloader: Error during feed deserialization:", err)
+            logger.dbg("NewsDownloader: content_type:", content_type, "response:", response)
+        end
     end
     -- If the response is not available (for a reason that we don't know),
     -- add the URL to the unsupported feeds list.
@@ -484,12 +564,14 @@ function NewsDownloader:processFeedSource(url, credentials, limit, unsupported_f
                     FEED_TYPE_ATOM,
                     feeds,
                     cookies,
+                    http_auth,
                     limit,
                     download_full_article,
                     include_images,
                     message,
                     enable_filter,
-                    filter_element
+                    filter_element,
+                    block_element
                 )
         end)
     elseif is_rss then
@@ -498,12 +580,14 @@ function NewsDownloader:processFeedSource(url, credentials, limit, unsupported_f
                     FEED_TYPE_RSS,
                     feeds,
                     cookies,
+                    http_auth,
                     limit,
                     download_full_article,
                     include_images,
                     message,
                     enable_filter,
-                    filter_element
+                    filter_element,
+                    block_element
                 )
         end)
     end
@@ -541,14 +625,14 @@ function NewsDownloader:deserializeXMLString(xml_str)
     xml_str = xml_str:gsub("^\xef\xbb\xbf", "", 1)
 
     -- Instantiate the object that parses the XML to a Lua table.
-    local ok = pcall(function()
+    local ok, err = pcall(function()
         libxml.xmlParser(xmlhandler):parse(xml_str)
     end)
-    if not ok then return end
+    if not ok then return false, err end
     return xmlhandler.root
 end
 
-function NewsDownloader:processFeed(feed_type, feeds, cookies, limit, download_full_article, include_images, message, enable_filter, filter_element)
+function NewsDownloader:processFeed(feed_type, feeds, cookies, http_auth, limit, download_full_article, include_images, message, enable_filter, filter_element, block_element)
     local feed_title
     local feed_item
     local total_items
@@ -559,12 +643,20 @@ function NewsDownloader:processFeed(feed_type, feeds, cookies, limit, download_f
         total_items = (limit == 0)
             and #feeds.rss.channel.item
             or limit
+        if feed_item[1] == nil and feed_item.title then
+            -- Normalize data for single-item feeds.
+            feed_item = {feed_item}
+        end
     else
-        feed_title = getFeedTitle(feeds.feed.title)
+        feed_title = self.getFeedTitle(feeds.feed.title)
         feed_item = feeds.feed.entry
         total_items = (limit == 0)
             and #feeds.feed.entry
             or limit
+        if feed_item[1] == nil and feed_item.title then
+            -- Normalize data for single-item feeds.
+            feed_item = {feed_item}
+        end
     end
     -- Get the path to the output directory.
     local feed_output_dir = ("%s%s/"):format(
@@ -594,7 +686,7 @@ function NewsDownloader:processFeed(feed_type, feeds, cookies, limit, download_f
             feed_description = feed.description and feed.description[1] or feed.description --- @todo This should select the one with type="html" if there is a choice.
             if feed["content:encoded"] ~= nil then
                 -- Spec: https://web.resource.org/rss/1.0/modules/content/
-                feed_description = feed["content:encoded"]
+                feed_description = feed["content:encoded"] and feed["content:encoded"][1] or feed["content:encoded"]
             end
         elseif feed_type == FEED_TYPE_ATOM then
             feed_title = feed.title and feed.title[1] or feed.title
@@ -604,24 +696,36 @@ function NewsDownloader:processFeed(feed_type, feeds, cookies, limit, download_f
             feed_description = feed.summary
         end
         -- Download the article.
+        local download_full_failed = false
         if download_full_article then
-            self:downloadFeed(
-                feed,
-                cookies,
-                feed_output_dir,
-                include_images,
-                article_message,
-                enable_filter,
-                filter_element
-            )
-        else
+            local ok, error = pcall(function()
+                self:downloadFeed(
+                    feed,
+                    cookies,
+                    http_auth,
+                    feed_output_dir,
+                    include_images,
+                    article_message,
+                    enable_filter,
+                    filter_element,
+                    block_element
+                )
+            end)
+            if not ok then
+                local link = self.getFeedLink(feed.link)
+                logger.warn("NewsDownloader: failed to download full article from", link, ":", error)
+                download_full_failed = true
+            end
+        end
+        if not download_full_article or download_full_failed then
             self:createFromDescription(
                 feed,
                 feed_title,
                 feed_description or "",
                 feed_output_dir,
                 include_images,
-                article_message
+                article_message,
+                download_full_failed
             )
         end
     end
@@ -640,7 +744,7 @@ local function parseDate(dateTime)
 end
 
 local function getTitleWithDate(feed)
-    local title = util.getSafeFilename(getFeedTitle(feed.title))
+    local title = util.getSafeFilename(NewsDownloader.getFeedTitle(feed.title))
     if feed.updated then
         title = parseDate(feed.updated) .. title
     elseif feed.pubDate then
@@ -651,7 +755,7 @@ local function getTitleWithDate(feed)
     return title
 end
 
-function NewsDownloader:downloadFeed(feed, cookies, feed_output_dir, include_images, message, enable_filter, filter_element)
+function NewsDownloader:downloadFeed(feed, cookies, http_auth, feed_output_dir, include_images, message, enable_filter, filter_element, block_element)
     local title_with_date = getTitleWithDate(feed)
     local news_file_path = ("%s%s%s"):format(feed_output_dir,
                                              title_with_date,
@@ -663,13 +767,31 @@ function NewsDownloader:downloadFeed(feed, cookies, feed_output_dir, include_ima
     else
         logger.dbg("NewsDownloader: News file will be stored to :", news_file_path)
         local article_message = T(_("%1\n%2"), message, title_with_date)
-        local link = getFeedLink(feed.link)
-        local html = DownloadBackend:loadPage(link, cookies)
-        DownloadBackend:createEpub(news_file_path, html, link, include_images, article_message, enable_filter, filter_element)
+        local link = self.getFeedLink(feed.link)
+        local extra_headers = nil
+        if http_auth and http_auth.username and http_auth.password then
+            extra_headers = { ["Authorization"] = "Basic " .. mime.b64((http_auth.username or "") .. ":" .. (http_auth.password or "")) }
+        end
+        local content_type, content = DownloadBackend:loadPage(link, cookies, extra_headers)
+        if not content_type then
+            logger.err("NewsDownloader: No content type, not saving", link)
+            return
+        end
+        content_type = util.trim(content_type:match("^[^;]*")) --- @todo Don't ignore encoding but use it for the EPUB.
+        if content_type == "text/html" or content_type == "application/xhtml+xml" then
+            DownloadBackend:createEpub(news_file_path, content, link, include_images, article_message, enable_filter, filter_element, block_element)
+        elseif DocumentRegistry:hasProvider(nil, content_type) then
+            local file = io.open(news_file_path, "w")
+            file:write(content)
+            file:close()
+        else
+            logger.err("NewsDownloader: Unsupported feed Content-Type:", content_type)
+            return
+        end
     end
 end
 
-function NewsDownloader:createFromDescription(feed, title, content, feed_output_dir, include_images, message)
+function NewsDownloader:createFromDescription(feed, title, content, feed_output_dir, include_images, message, download_full_failed)
     local title_with_date = getTitleWithDate(feed)
     local news_file_path = ("%s%s%s"):format(feed_output_dir,
                                              title_with_date,
@@ -680,9 +802,15 @@ function NewsDownloader:createFromDescription(feed, title, content, feed_output_
     else
         logger.dbg("NewsDownloader: News file will be stored to :", news_file_path)
         local article_message = T(_("%1\n%2"), message, title_with_date)
-        local footer = _("If this is only a summary, the full article can be downloaded by going to the News Downloader settings and changing 'Download full article' to 'true'.")
+        local byline = getByline(feed)
+        local footer
+        if download_full_failed then
+            footer = _("Downloading the full article failed. To retry, delete this file and sync again.")
+        else
+            footer = _("If this is only a summary, the full article can be downloaded by going to the News Downloader settings and changing 'Download full article' to 'true'.")
+        end
 
-        local base_url = getFeedLink(feed.link)
+        local base_url = self.getFeedLink(feed.link)
         if base_url then
             if not base_url:match("/$") then
                 base_url = base_url .. "/"
@@ -707,13 +835,14 @@ function NewsDownloader:createFromDescription(feed, title, content, feed_output_
 <title>%s</title>
 </head>
 <body>
-<header><h1>%s</h1></header>
+<header><h1>%s</h1><p><address>%s</address></p></header>
+<br>
 <article>%s</article>
 <br>
 <footer><small>%s</small></footer>
 </body>
-</html>]], title, title, content, footer)
-        local link = getFeedLink(feed.link)
+</html>]], title, title, byline, content, footer)
+        local link = self.getFeedLink(feed.link)
         DownloadBackend:createEpub(news_file_path, html, link, include_images, article_message)
     end
 end
@@ -849,7 +978,10 @@ function NewsDownloader:editFeedAttribute(id, key, value)
     -- attribute will need and displays the corresponding dialog.
     if key == FeedView.URL
         or key == FeedView.LIMIT
-        or key == FeedView.FILTER_ELEMENT then
+        or key == FeedView.FILTER_ELEMENT
+        or key == FeedView.BLOCK_ELEMENT
+        or key == FeedView.HTTP_AUTH_USERNAME
+        or key == FeedView.HTTP_AUTH_PASSWORD then
 
         local title
         local input_type
@@ -865,6 +997,16 @@ function NewsDownloader:editFeedAttribute(id, key, value)
         elseif key == FeedView.FILTER_ELEMENT then
             title = _("Edit filter element.")
             description = _("Filter based on the given CSS selector. E.g.: name_of_css.element.class")
+            input_type = "string"
+        elseif key == FeedView.BLOCK_ELEMENT then
+            title = _("Edit block element.")
+            description = _("Block element based on the given CSS selector. E.g.: name_of_css.element.class")
+            input_type = "string"
+        elseif key == FeedView.HTTP_AUTH_USERNAME then
+            title = _("HTTP auth username")
+            input_type = "string"
+        elseif key == FeedView.HTTP_AUTH_PASSWORD then
+            title = _("HTTP auth password")
             input_type = "string"
         else
             return false
@@ -1052,6 +1194,24 @@ function NewsDownloader:updateFeedConfig(id, key, value)
                         }
                     )
                 end
+            elseif key == FeedView.BLOCK_ELEMENT then
+                if feed.block_element then
+                    feed.block_element = value
+                else
+                    table.insert(
+                        feed,
+                        {
+                            "block_element",
+                            value
+                        }
+                    )
+                end
+            elseif key == FeedView.HTTP_AUTH_USERNAME then
+                feed.http_auth = feed.http_auth or { username = "", password = "" }
+                feed.http_auth.username = value or ""
+            elseif key == FeedView.HTTP_AUTH_PASSWORD then
+                feed.http_auth = feed.http_auth or { username = "", password = "" }
+                feed.http_auth.password = value or ""
             end
         end
         -- Now we insert the updated (or newly created) feed into the
