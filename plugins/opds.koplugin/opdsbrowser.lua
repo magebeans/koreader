@@ -1512,12 +1512,19 @@ function OPDSBrowser:checkSyncDownload(idx)
         }
         UIManager:show(info)
         UIManager:forceRePaint()
+        local function progress_callback(count)
+            info.text = T(N_("Synchronizing lists… (%1 item)", "Synchronizing lists… (%1 items)", count), count)
+            info:free()
+            info:init()
+            UIManager:setDirty(info, "ui")
+            UIManager:forceRePaint()
+        end
         if idx then
-            self:fillPendingSyncs(self.servers[idx-1]) -- First item is "Downloads"
+            self:fillPendingSyncs(self.servers[idx-1], progress_callback) -- First item is "Downloads"
         else
             for _, item in ipairs(self.servers) do
                 if item.sync then
-                    self:fillPendingSyncs(item)
+                    self:fillPendingSyncs(item, progress_callback)
                 end
             end
         end
@@ -1540,7 +1547,7 @@ function OPDSBrowser:checkSyncDownload(idx)
 end
 
 -- Add entries to self.pending_syncs
-function OPDSBrowser:fillPendingSyncs(server)
+function OPDSBrowser:fillPendingSyncs(server, progress_callback)
     self.root_catalog_password  = server.password
     self.root_catalog_raw_names = server.raw_names
     self.root_catalog_username  = server.username
@@ -1559,7 +1566,7 @@ function OPDSBrowser:fillPendingSyncs(server)
             file_list[util.trim(filetype)] = true
         end
     end
-    local sync_list = self:getSyncDownloadList()
+    local sync_list = self:getSyncDownloadList(nil, progress_callback)
     if sync_list then
         for i, entry in ipairs(sync_list) do
             -- for project gutenberg
@@ -1609,7 +1616,7 @@ function OPDSBrowser:fillPendingSyncs(server)
 end
 
 -- Get list of books to download bigger than sync_max_dl
-function OPDSBrowser:getSyncDownloadList(url_arg)
+function OPDSBrowser:getSyncDownloadList(url_arg, progress_callback)
     local sync_table = {}
     local fetch_url = url_arg or self.sync_server.url
     local sub_table
@@ -1663,6 +1670,9 @@ function OPDSBrowser:getSyncDownloadList(url_arg)
                     table.insert(sync_table, entry)
                 end
             end
+        end
+        if progress_callback then
+            progress_callback(#sync_table)
         end
         if not sub_table.hrefs.next then
             break
